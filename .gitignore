@@ -1,0 +1,11 @@
+*.Rproj
+.Rhistory
+.RData
+.Rapp.history
+.Rproj.user
+.DS_Store
+*.tsv
+*.xlsx
+*.pdf
+*.zip
+*.rds
