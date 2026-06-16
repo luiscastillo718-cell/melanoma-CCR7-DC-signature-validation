@@ -1,10 +1,8 @@
 # =============================================================================
-# CCR7⁺ DC Signature Analysis - Cutaneous + Acral Melanoma
-# FULL REPRODUCIBLE SCRIPT (GitHub-ready)
+# CCR7⁺ DC Signature Analysis - ALL Subtypes (Pre & On/Post-treatment)
+# Final clean version - Dual mRegDC signatures only
 # =============================================================================
-# Author: Luis Castillo
-# Date: April 2026
-# Manuscript term: CCR7⁺ DC signature (technical name: mRegDC)
+# Ready to run in a fresh RStudio session
 # =============================================================================
 
 setwd("/Users/lcastillo6/Desktop/Melanoma human data analysis")
@@ -25,33 +23,48 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 signature_name <- "CCR7+ DC signature"
 
 # 1. Load data
-expr_full <- fread("RNA-CancerCell-MORRISON1-combat_batch_corrected-logcpm-all_samples.tsv", data.table = FALSE)
+expr_full <- fread("RNA-CancerCell-MORRISON1-combat_batch_corrected-logcpm-all_samples.tsv",
+                   data.table = FALSE)
 rownames(expr_full) <- expr_full[[1]]
 expr_full <- expr_full[,-1]
 
 meta_rna <- fread("RNA-CancerCell-MORRISON1-metadata.tsv", data.table = FALSE)
 meta_subjects <- fread("Subjects-CancerCell-MORRISON1-metadata.tsv", data.table = FALSE)
 
+# Primary mRegDC list
 mregdc_list <- read_excel("mRegDC gene list (Yang et al. 2025, Nat Commun).xlsx", sheet = 1)
 mregdc_genes <- unique(na.omit(mregdc_list[[1]]))
 
-# 2. Compute CCR7⁺ DC signature scores
+# Maier et al. 2020 mRegDC signature
+maier_mregdc_list <- read_excel("/Users/lcastillo6/Desktop/Melanoma human data analysis/Human DC genes validated by Maier et al. Nature 2020.xlsx", sheet = 1)
+maier_mregdc_genes <- unique(na.omit(maier_mregdc_list[[1]]))
+
+cat("Primary mRegDC genes:", length(mregdc_genes), "\n")
+cat("Maier mRegDC genes:", length(maier_mregdc_genes), "\n")
+
+# 2. Compute both signatures
 expr_mat <- as.matrix(expr_full)
 storage.mode(expr_mat) <- "numeric"
 
-gsva_param <- gsvaParam(expr_mat, list(mRegDC = mregdc_genes), minSize = 10, maxSize = 1000)
-ssgsea_scores <- gsva(gsva_param, verbose = TRUE)
+gsva_param1 <- gsvaParam(expr_mat, list(mRegDC = mregdc_genes), minSize = 10, maxSize = 1000)
+ssgsea1 <- gsva(gsva_param1, verbose = TRUE)
 
-mregdc_df <- data.frame(sample_id = colnames(ssgsea_scores),
-                        mRegDC_score = as.numeric(ssgsea_scores["mRegDC", ]))
+gsva_param2 <- gsvaParam(expr_mat, list(Maier_mRegDC = maier_mregdc_genes), minSize = 10, maxSize = 1000)
+ssgsea2 <- gsva(gsva_param2, verbose = TRUE)
 
-# 3. Merge + Filter
+mregdc_df <- data.frame(sample_id = colnames(ssgsea1),
+                        mRegDC_score = as.numeric(ssgsea1["mRegDC", ]))
+
+maier_df <- data.frame(sample_id = colnames(ssgsea2),
+                       Maier_mRegDC_score = as.numeric(ssgsea2["Maier_mRegDC", ]))
+
+# 3. Merge and prepare data
 meta_merged <- meta_rna %>%
   left_join(mregdc_df, by = c("sample.id" = "sample_id")) %>%
+  left_join(maier_df, by = c("sample.id" = "sample_id")) %>%
   left_join(meta_subjects, by = "subject.id", suffix = c("", "_subj")) %>%
   filter(!is.na(mRegDC_score)) %>%
   filter(grepl("PD1|Combo", treatment.regimen.name, ignore.case = TRUE)) %>%
-  filter(grepl("cutaneous|acral", sample.tumor.type, ignore.case = TRUE)) %>%
   mutate(
     Timepoint_Group = case_when(
       grepl("pre|baseline", timepoint.id, ignore.case = TRUE) ~ "Pre-treatment",
@@ -60,34 +73,37 @@ meta_merged <- meta_rna %>%
     ),
     response_binary = ifelse(bor %in% c("CR", "PR"), "Responder", "Non-responder"),
     response_binary = factor(response_binary, levels = c("Non-responder", "Responder")),
-    mRegDC_high_low = factor(ifelse(mRegDC_score >= median(mRegDC_score, na.rm = TRUE), "High", "Low"), 
+    mRegDC_high_low = factor(ifelse(mRegDC_score >= median(mRegDC_score, na.rm = TRUE), "High", "Low"),
                              levels = c("High", "Low")),
-    Tumor_Type = sample.tumor.type
+    CCR7_group = factor(mRegDC_high_low,
+                        levels = c("High", "Low"),
+                        labels = c("CCR7+DC High", "CCR7+DC Low")),
+    Tumor_Type = sample.tumor.type,
+    OS_time = os,
+    PFS_time = pfs,
+    OS_event = ifelse(!is.na(os), 1, NA),
+    PFS_event = ifelse(!is.na(pfs), 1, NA)
   )
 
-cat("FINAL DATASET:", nrow(meta_merged), "samples\n")
-print(table(meta_merged$Timepoint_Group, meta_merged$response_binary))
+cat("FINAL DATASET:", nrow(meta_merged), "samples\n\n")
+cat("Tumor subtype distribution:\n")
+print(table(meta_merged$Tumor_Type))
 
-# 4. Mandatory DC Abundance Estimation (simple robust marker average)
-cat("\n=== Computing DC Abundance (Marker Gene Average) ===\n")
-dc_markers <- c("HLA-DRA", "CD1C", "CLEC9A", "BATF3", "IRF8", "ITGAX", "CD83")
-dc_markers <- intersect(dc_markers, rownames(expr_mat))
+# Refresh subsets
+pre_data   <- meta_merged %>% filter(Timepoint_Group == "Pre-treatment")
+onpost_data <- meta_merged %>% filter(Timepoint_Group == "On_Post-treatment")
 
-if (length(dc_markers) > 0) {
-  meta_merged$DC_abundance <- colMeans(expr_mat[dc_markers, meta_merged$sample.id, drop = FALSE], na.rm = TRUE)
-  cat("Used", length(dc_markers), "DC marker genes for abundance estimation.\n")
-} else {
-  meta_merged$DC_abundance <- NA
-  cat("Warning: No DC markers found.\n")
-}
+cat("Sample sizes:\n")
+cat("  Pre-treatment:     ", nrow(pre_data), "\n")
+cat("  On/Post-treatment: ", nrow(onpost_data), "\n\n")
 
-# 5. Styled Analysis Function
+# 4. Analysis function (no number-at-risk CSVs)
 run_analysis <- function(data, title) {
-  if(nrow(data) < 10) return(NULL)
+  if (nrow(data) < 10) return(NULL)
   
-  cat("\n=== ", title, " (n =", nrow(data), ") ===\n")
+  cat("=== ", title, " (n =", nrow(data), ") ===\n")
   wilcox_p <- wilcox.test(mRegDC_score ~ response_binary, data = data)$p.value
-  cat("Wilcoxon p =", format.pval(wilcox_p, digits = 3), "\n")
+  cat("Wilcoxon p (mRegDC) =", format.pval(wilcox_p, digits = 3), "\n")
   
   p_box <- ggplot(data, aes(x = response_binary, y = mRegDC_score, fill = response_binary)) +
     geom_boxplot(outlier.shape = NA, alpha = 0.95, color = "#000000", linewidth = 0.95, fatten = 2.2) +
@@ -97,19 +113,21 @@ run_analysis <- function(data, title) {
     scale_fill_manual(values = c("Responder" = "#e31a1c", "Non-responder" = "#000000")) +
     theme_minimal(base_size = 15) +
     labs(title = paste(signature_name, "by RECIST Response -", title),
-         subtitle = paste("n =", nrow(data), "samples | Cutaneous + Acral only"),
+         subtitle = paste("n =", nrow(data), "samples | All subtypes"),
          y = paste(signature_name, "ssGSEA Score"), x = "") +
     theme(legend.position = "none")
   
   print(p_box)
-  ggsave(file.path(out_dir, paste0("CCR7_DC_Response_", gsub("/", "_", title), ".pdf")),
+  ggsave(file.path(out_dir, paste0("CCR7_DC_Response_", gsub(" ", "_", title), ".pdf")),
          p_box, width = 7, height = 6.5, dpi = 300)
   
-  # KM curves
-  data_surv <- data %>% filter(!is.na(os) | !is.na(pfs)) %>% mutate(OS_event = 1, PFS_event = 1)
-  if(nrow(data_surv) > 20) {
-    fit_os  <- survfit(Surv(os, OS_event) ~ mRegDC_high_low, data = data_surv)
-    fit_pfs <- survfit(Surv(pfs, PFS_event) ~ mRegDC_high_low, data = data_surv)
+  data_surv <- data %>% filter(!is.na(OS_time) | !is.na(PFS_time)) %>%
+    mutate(OS_event = ifelse(!is.na(OS_time), OS_event, 0),
+           PFS_event = ifelse(!is.na(PFS_time), PFS_event, 0))
+  
+  if (nrow(data_surv) > 20) {
+    fit_os  <- survfit(Surv(OS_time, OS_event) ~ CCR7_group, data = data_surv)
+    fit_pfs <- survfit(Surv(PFS_time, PFS_event) ~ CCR7_group, data = data_surv)
     
     p_os <- ggsurvplot(fit_os, data = data_surv, pval = TRUE, risk.table = TRUE,
                        title = paste("Overall Survival by", signature_name, "-", title),
@@ -123,52 +141,45 @@ run_analysis <- function(data, title) {
     
     print(p_os)
     print(p_pfs)
-    ggsave(file.path(out_dir, paste0("CCR7_DC_OS_KM_", gsub("/", "_", title), ".pdf")), 
+    ggsave(file.path(out_dir, paste0("CCR7_DC_OS_KM_", gsub(" ", "_", title), ".pdf")),
            plot = p_os$plot, width = 8, height = 6, dpi = 300)
-    ggsave(file.path(out_dir, paste0("CCR7_DC_PFS_KM_", gsub("/", "_", title), ".pdf")), 
+    ggsave(file.path(out_dir, paste0("CCR7_DC_PFS_KM_", gsub(" ", "_", title), ".pdf")),
            plot = p_pfs$plot, width = 8, height = 6, dpi = 300)
   }
 }
 
-# Run plots
-run_analysis(filter(meta_merged, Timepoint_Group == "Pre-treatment"), "Pre-treatment")
-run_analysis(filter(meta_merged, Timepoint_Group == "On_Post-treatment"), "On_Post-treatment")
+# 5. Run the two analyses
+run_analysis(pre_data,   "All subtypes - Pre-treatment")
+run_analysis(onpost_data, "All subtypes - On_Post-treatment")
 
-# 6. Export final table
+# 6. Correlation between the two mRegDC signatures
+cat("\n=== Spearman correlation between mRegDC_score and Maier_mRegDC_score ===\n")
+cor_pre <- cor.test(pre_data$mRegDC_score, pre_data$Maier_mRegDC_score, method = "spearman")
+cor_onpost <- cor.test(onpost_data$mRegDC_score, onpost_data$Maier_mRegDC_score, method = "spearman")
+
+cat("Pre-treatment:\n"); print(cor_pre)
+cat("\nOn/Post-treatment:\n"); print(cor_onpost)
+
+# 7. Export main summary table
 summary_table_final <- meta_merged %>%
   select(sample.id, Timepoint_Group, treatment.regimen.name, bor, response,
-         cohort, os, pfs, mRegDC_score, previous.treatment, Tumor_Type, DC_abundance) %>%
+         cohort, OS_time, PFS_time, OS_event, PFS_event,
+         mRegDC_score, Maier_mRegDC_score, previous.treatment, Tumor_Type) %>%
   arrange(Timepoint_Group, bor) %>%
   rename(Sample_ID = sample.id, Timepoint = Timepoint_Group,
          Treatment = treatment.regimen.name, BOR = bor, Cohort = cohort,
-         OS_days = os, PFS_days = pfs, Prior_treatment = previous.treatment)
+         Prior_treatment = previous.treatment)
 
-write.csv(summary_table_final, "mRegDC_PD1_Focused_Summary_Table_CUTANEOUS_ACRAL.csv", row.names = FALSE)
+write.csv(summary_table_final, "mRegDC_Dual_mRegDC_Signatures_Summary_Table.csv", row.names = FALSE)
+cat("\nMain summary table exported.\n")
 
-cat("\n✅ Full analysis complete! All outputs use 'CCR7+ DC signature' nomenclature.\n")
-cat("Files saved in:", out_dir, "\n")
+# 8. Missing genes table
+cat("\n=== Creating Supplementary Table for Missing mRegDC Genes ===\n")
+missing_genes <- setdiff(mregdc_genes, rownames(expr_full))
+write.csv(data.frame(Missing_Gene = missing_genes), 
+          "Supplementary_Table_Missing_mRegDC_genes.csv", row.names = FALSE)
+cat("Created with", length(missing_genes), "missing genes.\n")
+
+cat("\n✅ Final clean script completed successfully!\n")
+cat("All plots saved in:", out_dir, "\n")
 sessionInfo()
-# =============================================================================
-# Create Supplementary Table: Missing mRegDC Genes
-# =============================================================================
-
-cat("\n=== Creating Supplementary Table for Missing Genes ===\n")
-
-mregdc_list <- read_excel("mRegDC gene list (Yang et al. 2025, Nat Commun).xlsx", sheet = 1)
-mregdc_genes <- unique(na.omit(mregdc_list[[1]]))
-
-expr_genes <- rownames(expr_full)   # already loaded earlier in the script
-
-overlap_genes <- intersect(mregdc_genes, expr_genes)
-missing_genes <- setdiff(mregdc_genes, overlap_genes)
-
-supp_missing <- data.frame(
-  Missing_Gene = missing_genes,
-  stringsAsFactors = FALSE
-)
-
-write.csv(supp_missing, "Supplementary_Table_Missing_mRegDC_genes.csv", row.names = FALSE)
-
-cat("Supplementary table created!\n")
-cat("File saved as: Supplementary_Table_Missing_mRegDC_genes.csv\n")
-cat("Total missing genes:", nrow(supp_missing), "\n")
